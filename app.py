@@ -1,25 +1,18 @@
 import os
 import uuid
 import requests
-from flask import Flask, render_template_string, request, redirect, url_for, flash
+import json
+from flask import Flask, render_template_string, request, redirect, url_for, flash, send_file
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 app = Flask(__name__)
-app.secret_key = 'replace_this_with_a_secure_secret_key'
+app.secret_key = 'super_secret_key_change_me'
 
-# Database Configuration (SQLite for local, PostgreSQL for Render)
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///cronjobs.sqlite')
+# The text/JSON file where we will save the data
+CONFIG_FILE = 'cron_config.json'
 
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-# Configure APScheduler to use the database to remember jobs across server restarts
-jobstores = {
-    'default': SQLAlchemyJobStore(url=DATABASE_URL)
-}
-
-scheduler = BackgroundScheduler(jobstores=jobstores)
+# Initialize the Scheduler
+scheduler = BackgroundScheduler()
 scheduler.start()
 
 def ping_target(url):
@@ -30,6 +23,56 @@ def ping_target(url):
     except Exception as e:
         print(f"Failed: Could not reach {url} - Error: {str(e)}")
 
+def init_file():
+    """Create the config file if it doesn't exist."""
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump({}, f)
+
+def load_jobs_from_file():
+    """Read the config file and load jobs into the scheduler on startup."""
+    init_file()
+    with open(CONFIG_FILE, 'r') as f:
+        jobs = json.load(f)
+        
+    for job_id, data in jobs.items():
+        url = data['url']
+        value = data['value']
+        schedule_type = data['schedule_type']
+        
+        if schedule_type == 'minutes':
+            scheduler.add_job(ping_target, 'interval', minutes=value, args=[url], id=job_id, replace_existing=True)
+        elif schedule_type == 'hours':
+            scheduler.add_job(ping_target, 'interval', hours=value, args=[url], id=job_id, replace_existing=True)
+
+# Load jobs immediately when the app starts
+load_jobs_from_file()
+
+def save_job_to_file(job_id, url, schedule_type, value):
+    """Save a new job to the text file."""
+    with open(CONFIG_FILE, 'r') as f:
+        jobs = json.load(f)
+    
+    jobs[job_id] = {
+        'url': url,
+        'schedule_type': schedule_type,
+        'value': value
+    }
+    
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(jobs, f, indent=4)
+
+def delete_job_from_file(job_id):
+    """Remove a job from the text file."""
+    with open(CONFIG_FILE, 'r') as f:
+        jobs = json.load(f)
+        
+    if job_id in jobs:
+        del jobs[job_id]
+        
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(jobs, f, indent=4)
+
 
 # Embedded HTML Template
 HTML_TEMPLATE = """
@@ -38,13 +81,16 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Professional Cron Manager</title>
+    <title>File-Based Cron Manager</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body class="bg-light">
 
 <div class="container mt-5">
-    <h2 class="mb-4">Cronjob Manager</h2>
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2>Cronjob Manager</h2>
+        <a href="/download" class="btn btn-outline-primary">⬇️ Download Config File</a>
+    </div>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
@@ -58,7 +104,7 @@ HTML_TEMPLATE = """
     {% endwith %}
 
     <div class="card shadow-sm mb-5">
-        <div class="card-header bg-primary text-white">
+        <div class="card-header bg-dark text-white">
             <h5 class="card-title mb-0">Add a New Cronjob</h5>
         </div>
         <div class="card-body">
@@ -85,14 +131,14 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <h4 class="mb-3">Active Jobs</h4>
+    <h4 class="mb-3">Active Jobs (Saved in File)</h4>
     <div class="card shadow-sm">
         <div class="card-body p-0">
             <table class="table table-hover mb-0">
-                <thead class="table-dark">
+                <thead class="table-light">
                     <tr>
                         <th>Target URL</th>
-                        <th>Schedule Trigger</th>
+                        <th>Schedule</th>
                         <th>Next Run (UTC)</th>
                         <th>Actions</th>
                     </tr>
@@ -109,7 +155,7 @@ HTML_TEMPLATE = """
                     </tr>
                     {% else %}
                     <tr>
-                        <td colspan="4" class="text-center py-4 text-muted">No active cronjobs running. Add one above!</td>
+                        <td colspan="4" class="text-center py-4 text-muted">No active cronjobs. Add one above!</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -125,17 +171,24 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    # Fetch all active jobs from the database
-    jobs = scheduler.get_jobs()
+    # Read the text file to get the list of jobs
+    init_file()
+    with open(CONFIG_FILE, 'r') as f:
+        saved_jobs = json.load(f)
+        
     job_list = []
-    for job in jobs:
+    for job_id, data in saved_jobs.items():
+        # Ask APScheduler when this job is running next
+        job_instance = scheduler.get_job(job_id)
+        next_run = job_instance.next_run_time.strftime('%Y-%m-%d %H:%M:%S') if job_instance and job_instance.next_run_time else 'Unknown'
+        
         job_list.append({
-            'id': job.id,
-            'url': job.args[0] if job.args else 'Unknown URL',
-            'trigger': str(job.trigger),
-            'next_run': job.next_run_time.strftime('%Y-%m-%d %H:%M:%S') if job.next_run_time else 'Paused'
+            'id': job_id,
+            'url': data['url'],
+            'trigger': f"Every {data['value']} {data['schedule_type']}",
+            'next_run': next_run
         })
-    # Render the embedded string instead of an external file
+        
     return render_template_string(HTML_TEMPLATE, jobs=job_list)
 
 @app.route('/add', methods=['POST'])
@@ -148,29 +201,43 @@ def add_job():
         flash("A target URL is required!", "danger")
         return redirect(url_for('index'))
 
-    # Generate a unique ID for the job
     job_id = str(uuid.uuid4())
 
-    # Add the job to the scheduler based on user selection
+    # 1. Add to the active scheduler
     if schedule_type == 'minutes':
         scheduler.add_job(ping_target, 'interval', minutes=value, args=[url], id=job_id)
     elif schedule_type == 'hours':
         scheduler.add_job(ping_target, 'interval', hours=value, args=[url], id=job_id)
 
-    flash(f"Successfully added cron job for {url} (Runs every {value} {schedule_type}).", "success")
+    # 2. Save the data to the text file
+    save_job_to_file(job_id, url, schedule_type, value)
+
+    flash(f"Successfully added cron job. Data saved to file.", "success")
     return redirect(url_for('index'))
 
 @app.route('/delete/<job_id>')
 def delete_job(job_id):
     try:
-        scheduler.remove_job(job_id)
-        flash("Job successfully deleted.", "success")
-    except Exception:
-        flash("Error deleting job or job not found.", "danger")
+        # 1. Remove from active scheduler
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+        
+        # 2. Delete from text file
+        delete_job_from_file(job_id)
+        
+        flash("Job successfully deleted and removed from file.", "success")
+    except Exception as e:
+        flash(f"Error deleting job: {str(e)}", "danger")
+        
     return redirect(url_for('index'))
 
+@app.route('/download')
+def download_config():
+    """Allows the user to download the cron configuration file."""
+    init_file()
+    return send_file(CONFIG_FILE, as_attachment=True, download_name="cron_jobs_backup.txt")
+
 if __name__ == '__main__':
-    # Grab the port Render assigns, default to 5000 if running locally
+    # Binds correctly for both Local and Render
     port = int(os.environ.get('PORT', 5000))
-    # Must bind to 0.0.0.0 for Render to route traffic properly
     app.run(host='0.0.0.0', port=port)
