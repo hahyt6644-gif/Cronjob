@@ -170,4 +170,7 @@ def delete_job(job_id):
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Grab the port Render assigns, default to 5000 if running locally
+    port = int(os.environ.get('PORT', 5000))
+    # Must bind to 0.0.0.0 for Render to route traffic properly
+    app.run(host='0.0.0.0', port=port)
